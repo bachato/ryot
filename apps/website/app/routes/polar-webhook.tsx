@@ -1,12 +1,14 @@
-import { validateEvent } from "@polar-sh/sdk/webhooks";
+import {
+	validateEvent,
+	WebhookVerificationError,
+} from "@polar-sh/sdk/webhooks";
 import { data } from "react-router";
 import { match } from "ts-pattern";
-import type { TPlanTypes, TProductTypes } from "~/drizzle/schema.server";
 import {
 	revokeCancellation,
 	revokePurchaseInProgress,
 } from "~/lib/caches.server";
-import { getPolarProducts, getPolarWebhookSecret } from "~/lib/config.server";
+import { getPolarWebhookSecret } from "~/lib/config.server";
 import {
 	findCustomerById,
 	findCustomerByPolarId,
@@ -16,6 +18,7 @@ import {
 	handlePurchaseOrRenewal,
 	revokePurchase,
 } from "~/lib/provisioning.server";
+import { getProductAndPlanTypeByPolarIds } from "~/lib/utilities.server";
 import type { Route } from "./+types/polar-webhook";
 
 async function findCustomer(
@@ -28,20 +31,6 @@ async function findCustomer(
 		externalCustomerId,
 		findCustomerById,
 	);
-}
-
-function findPlanAndProductType(
-	productId: string,
-): { planType: TPlanTypes; productType: TProductTypes } | null {
-	const products = getPolarProducts();
-
-	for (const product of products) {
-		const matchingPrice = product.prices.find((p) => p.productId === productId);
-		if (matchingPrice)
-			return { productType: product.type, planType: matchingPrice.name };
-	}
-
-	return null;
 }
 
 async function handleOrderPaid(
@@ -67,7 +56,8 @@ async function handleOrderPaid(
 	const productId = order.productId;
 	if (!productId) return { error: "Product ID not found in order" };
 
-	const planAndProduct = findPlanAndProductType(productId);
+	const priceId = order.items[0]?.productPriceId;
+	const planAndProduct = getProductAndPlanTypeByPolarIds(productId, priceId);
 	if (!planAndProduct)
 		return { error: `No matching product found for product ID: ${productId}` };
 
@@ -78,6 +68,11 @@ async function handleOrderPaid(
 		planType,
 		productType,
 		polarCustomerId,
+		{
+			paymentProvider: "polar",
+			providerProductId: productId,
+			providerPriceId: priceId ?? undefined,
+		},
 	);
 	revokePurchaseInProgress(customer.id);
 
@@ -120,18 +115,40 @@ export const action = async ({ request }: Route.ActionArgs) => {
 	try {
 		event = validateEvent(body, headers, webhookSecret);
 	} catch (error) {
-		console.error("Webhook validation failed:", error);
-		return data({ error: "Invalid webhook signature" }, { status: 401 });
+		console.error("Polar webhook validation failed:", error);
+		const isInvalidSignature = error instanceof WebhookVerificationError;
+		return data(
+			{
+				error: isInvalidSignature
+					? "Invalid webhook signature"
+					: "Invalid webhook payload",
+			},
+			{ status: isInvalidSignature ? 401 : 400 },
+		);
 	}
 
 	console.log("Received Polar webhook event:", { type: event.type });
 
-	const result = await match(event.type)
-		.with("order.paid", () => handleOrderPaid(event))
-		.with("subscription.revoked", () => handleSubscriptionRevoked(event))
-		.otherwise(() => ({ message: "Webhook event not handled" }));
+	let result: { error?: string; message?: string };
+	try {
+		result = await match(event.type)
+			.with("order.paid", () => handleOrderPaid(event))
+			.with("subscription.revoked", () => handleSubscriptionRevoked(event))
+			.otherwise(() => ({ message: "Webhook event not handled" }));
+	} catch (error) {
+		console.error("Polar webhook handling failed:", error);
+		return data(
+			{ error: "Polar webhook could not be processed" },
+			{ status: 503 },
+		);
+	}
 
 	console.log("Webhook handling result:", result);
 
-	return data(result);
+	const status = result.error?.startsWith("No matching product found")
+		? 503
+		: result.error === "Product ID not found in order"
+			? 400
+			: 200;
+	return data(result, { status });
 };
